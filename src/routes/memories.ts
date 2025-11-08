@@ -216,6 +216,48 @@ router.get('/search', async (req: Request, res: Response): Promise<void> => {
       message: error.message || 'Failed to search memories.'
     });
   }
+
+/**
+ * POST /api/v1/memories/search
+ * Semantic search using vector similarity (POST version for body params)
+ */
+router.post('/search', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const user = req.user!;
+    const { query, limit = 10 } = req.body;
+
+    if (!query || typeof query !== 'string') {
+      res.status(400).json({
+        error: 'Bad Request',
+        message: 'Query field is required.'
+      });
+      return;
+    }
+
+    const queryEmbedding = await generateEmbedding(query);
+
+    const { data, error } = await supabase.rpc('match_memories', {
+      query_embedding: JSON.stringify(queryEmbedding),
+      match_threshold: 0.5,
+      match_count: parseInt(String(limit)),
+      filter_user_id: user.id
+    });
+
+    if (error) throw error;
+
+    res.json({
+      memories: data || [],
+      count: data?.length || 0,
+      query
+    });
+  } catch (error: any) {
+    console.error('Error searching memories:', error);
+    res.status(500).json({
+      error: 'Internal Server Error',
+      message: error.message || 'Failed to search memories.'
+    });
+  }
+});
 });
 
 /**
