@@ -5,7 +5,7 @@
   "scripts": {
     "build": "rm -rf dist && tsc",
     "dev": "tsx src/index.ts --stdio",
-    "start": "node dist/index.js --stdio"
+    "start": "node dist/index.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
