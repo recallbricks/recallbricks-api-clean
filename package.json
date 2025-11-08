@@ -3,10 +3,9 @@
   "version": "2.0.0",
   "type": "module",
   "scripts": {
-    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
-    "build": "npm run clean && tsc",
+    "build": "rm -rf dist && tsc",
     "dev": "tsx src/index.ts --stdio",
-    "start": "npm run build && node dist/index.js --stdio"
+    "start": "node dist/index.js --stdio"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
