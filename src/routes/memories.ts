@@ -216,6 +216,7 @@ router.get('/search', async (req: Request, res: Response): Promise<void> => {
       message: error.message || 'Failed to search memories.'
     });
   }
+});
 
 /**
  * POST /api/v1/memories/search
