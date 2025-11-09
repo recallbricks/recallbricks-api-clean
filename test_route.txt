@@ -1,0 +1,6 @@
+
+Add this line right after line 224 (after router.post('/search'...):
+console.log('✅ POST /search route registered');
+
+And add this at the very end of memories.ts before export:
+console.log('✅ Memory routes loaded, total routes:', router.stack.length);

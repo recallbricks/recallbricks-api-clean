@@ -1,48 +1,46 @@
 import { Request, Response, NextFunction } from 'express';
+import { Errors } from '../utils/errors.js';
+import { logger } from '../utils/logger.js';
 
 export async function authenticateApiKey(
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  try {
-    const apiKey = req.headers['x-api-key'] as string;
-    const expectedKey = process.env.API_KEY;
+  const apiKey = req.headers['x-api-key'] as string;
+  const expectedKey = process.env.API_KEY;
 
-    console.log('Auth attempt with key:', apiKey ? apiKey.substring(0, 20) + '...' : 'MISSING');
-    console.log('Expected key:', expectedKey ? expectedKey.substring(0, 20) + '...' : 'MISSING');
+  logger.debug('API key authentication attempt', {
+    requestId: req.requestId,
+    hasApiKey: !!apiKey,
+    keyPrefix: apiKey ? apiKey.substring(0, 10) + '...' : 'MISSING',
+  });
 
-    if (!apiKey) {
-      res.status(401).json({
-        error: 'Unauthorized',
-        message: 'API key is required. Provide it in the X-API-Key header.'
-      });
-      return;
-    }
-
-    if (apiKey !== expectedKey) {
-      res.status(401).json({
-        error: 'Unauthorized',
-        message: 'Invalid API key.'
-      });
-      return;
-    }
-
-    // Create a mock user for now
-    req.user = {
-      id: '00000000-0000-0000-0000-000000000001',
-      api_key: apiKey
-    } as any;
-
-    console.log('Auth successful');
-    next();
-  } catch (error) {
-    console.error('Authentication error:', error);
-    res.status(500).json({
-      error: 'Internal Server Error',
-      message: 'Authentication failed.'
-    });
+  if (!apiKey) {
+    throw Errors.missingApiKey();
   }
+
+  if (apiKey !== expectedKey) {
+    logger.warn('Invalid API key attempt', {
+      requestId: req.requestId,
+      keyPrefix: apiKey.substring(0, 10) + '...',
+    });
+    throw Errors.invalidApiKey();
+  }
+
+  // Create a mock user for now
+  // In production, this would look up the user in the database
+  req.user = {
+    id: '00000000-0000-0000-0000-000000000001',
+    api_key: apiKey,
+  } as any;
+
+  logger.debug('API key authentication successful', {
+    requestId: req.requestId,
+    userId: req.user?.id,
+  });
+
+  next();
 }
 
-export default authenticateApiKey;// Force rebuild
+export default authenticateApiKey;
