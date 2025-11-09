@@ -7,7 +7,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { supabase } from '../config/supabase.js';
 import { authenticateApiKey } from '../middleware/auth.js';
-});
+import { ContextRequest } from '../types/recallbricks.js';
 
 const router = Router();
 
