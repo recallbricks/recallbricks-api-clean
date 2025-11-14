@@ -27,6 +27,7 @@ import { globalRateLimit, apiKeyRateLimit, rateLimitStatusEndpoint } from './mid
 import memoriesRouter from './routes/memories.js';
 import contextRouter from './routes/context.js';
 import healthRouter from './routes/health.js';
+import relationshipsRouter from './routes/relationships.js';
 
 // Utilities
 import { logger } from './utils/logger.js';
@@ -114,6 +115,7 @@ app.get("/", (_req: Request, res: Response) => {
       "Health Checks",
       "Prometheus Metrics",
       "Request Validation",
+      "AI-Powered Relationship Detection",
     ],
     status: "healthy",
     environment: NODE_ENV,
@@ -122,6 +124,7 @@ app.get("/", (_req: Request, res: Response) => {
 
 // API v1 routes (with authentication and rate limiting)
 app.use('/api/v1/memories', memoriesRouter);
+app.use('/api/v1/relationships', relationshipsRouter);
 app.use('/api/v1', contextRouter);
 app.get('/api/v1/rate-limit', apiKeyRateLimit, rateLimitStatusEndpoint);
 

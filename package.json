@@ -8,6 +8,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.68.0",
     "@modelcontextprotocol/sdk": "^1.0.4",
     "@supabase/supabase-js": "^2.47.10",
     "@types/cors": "^2.8.17",

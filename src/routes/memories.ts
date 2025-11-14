@@ -9,16 +9,21 @@ import { supabase } from '../config/supabase.js';
 import { authenticateApiKey } from '../middleware/auth.js';
 import { CreateMemoryRequest, Memory } from '../types/recallbricks.js';
 import OpenAI from 'openai';
+import { detectRelationships } from '../services/relationshipDetector.js';
+import { relationshipConfig } from '../config/relationshipDetection.js';
 
 const router = Router();
 
-// Initialize OpenAI client
-const openai = new OpenAI({
+// Initialize OpenAI client (optional)
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
-});
+}) : null;
 
-// Function to extract key information using OpenAI GPT-4o-mini
+// Function to extract key information using OpenAI GPT-4o-mini (optional)
 async function extractKeyInfo(text: string): Promise<string> {
+  if (!openai) {
+    return text; // Skip extraction if no OpenAI key
+  }
   try {
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -40,13 +45,15 @@ async function extractKeyInfo(text: string): Promise<string> {
     return extracted || text;
   } catch (error) {
     console.error('Error extracting key information:', error);
-    // If extraction fails, return original text
     return text;
   }
 }
 
-// Function to generate embedding
-async function generateEmbedding(text: string): Promise<number[]> {
+// Function to generate embedding (optional)
+async function generateEmbedding(text: string): Promise<number[] | null> {
+  if (!openai) {
+    return null; // Skip embeddings if no OpenAI key
+  }
   try {
     const response = await openai.embeddings.create({
       model: 'text-embedding-3-small',
@@ -55,7 +62,7 @@ async function generateEmbedding(text: string): Promise<number[]> {
     return response.data[0].embedding;
   } catch (error) {
     console.error('Error generating embedding:', error);
-    throw error;
+    return null;
   }
 }
 
@@ -71,32 +78,24 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
     const { text, source, project_id, tags, metadata }: CreateMemoryRequest = req.body;
 
-    if (!text) {
-      res.status(400).json({
-        error: 'Bad Request',
-        message: 'Text is required.'
-      });
-      return;
-    }
-
-    // Extract key information using OpenAI GPT-4o-mini
+   // Extract key information (optional)
     const extractedText = await extractKeyInfo(text);
 
-    // Generate embedding for semantic search using extracted text
+    // Generate embedding (optional)
     const embedding = await generateEmbedding(extractedText);
 
     const memory = {
       user_id: user.id,
-      text: extractedText, // Save the extracted key information
+      text: extractedText,
       source: source || 'api',
       project_id: project_id || 'default',
       tags: tags || [],
       metadata: {
         ...metadata,
-        original_text: text, // Preserve original text in metadata
-        extracted: true
+        original_text: text,
+        extracted: !!openai
       },
-      embedding: `[${embedding.join(',')}]`, // Convert to pgvector string format
+      embedding: embedding ? `[${embedding.join(',')}]` : null,
     };
 
     const { data, error } = await supabase
@@ -106,6 +105,19 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
       .single();
 
     if (error) throw error;
+
+    // Trigger async relationship detection (fire-and-forget)
+    if (data?.id && relationshipConfig.asyncExecution) {
+      detectRelationships(data.id, extractedText, user.id)
+        .then(result => {
+          if (result.success && result.relationshipsFound > 0) {
+            console.log(`✓ Detected ${result.relationshipsFound} relationships for memory ${data.id}`);
+          }
+        })
+        .catch(err => {
+          console.error('Background relationship detection failed:', err);
+        });
+    }
 
     res.status(201).json(data);
   } catch (error: any) {
@@ -449,7 +461,7 @@ router.put('/:id', async (req: Request, res: Response): Promise<void> => {
       updates.text = text;
       // Regenerate embedding if text changed
       const newEmbedding = await generateEmbedding(text);
-      updates.embedding = `[${newEmbedding.join(',')}]`;
+      updates.embedding = newEmbedding ? `[${newEmbedding.join(',')}]` : null;
     }
     if (tags) updates.tags = tags;
     if (metadata) updates.metadata = metadata;

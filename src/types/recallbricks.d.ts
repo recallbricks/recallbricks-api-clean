@@ -33,6 +33,34 @@ export interface CreateMemoryRequest {
   metadata?: Record<string, any>;
 }
 
+export interface MemoryRelationship {
+  id: string;
+  memory_id: string;
+  related_memory_id: string;
+  relationship_type: 'related_to' | 'caused_by' | 'similar_to' | 'follows' | 'contradicts';
+  strength: number;
+  explanation: string;
+  created_at: string;
+}
+
+export interface DetectedRelationship {
+  memory_id: string;
+  related_memory_id: string;
+  relationship_type: 'related_to' | 'caused_by' | 'similar_to' | 'follows' | 'contradicts';
+  strength: number;
+  explanation: string;
+}
+
+export type RelationshipType = 'related_to' | 'caused_by' | 'similar_to' | 'follows' | 'contradicts';
+
+export interface RelationshipDetectionResult {
+  success: boolean;
+  relationshipsFound: number;
+  relationshipsStored: number;
+  processingTimeMs: number;
+  error?: string;
+}
+
 export interface ContextRequest {
   query: string;
   llm?: string;
