@@ -1,8 +1,8 @@
 # RecallBricks API v2.0
 
-**The Memory Layer for AI** - Production-Grade API
+**The Memory Layer for AI** - Production-Grade API with Self-Optimizing Intelligence
 
-RecallBricks API is a production-ready, scalable memory management system for AI applications. Store, retrieve, and search through AI memories with semantic search, intelligent context retrieval, and cross-LLM memory sharing.
+RecallBricks API is a production-ready, scalable memory management system for AI applications. Store, retrieve, and search through AI memories with semantic search, intelligent context retrieval, cross-LLM memory sharing, and **metacognitive learning** that continuously optimizes itself based on usage patterns and feedback.
 
 ## Features
 
@@ -26,6 +26,17 @@ RecallBricks API is a production-ready, scalable memory management system for AI
 - **Cross-LLM Memory** - Share memories across different AI models
 - **Full-Text Search** - PostgreSQL full-text search with relevance scoring
 - **MCP Integration** - Model Context Protocol support for Claude
+
+### Metacognitive Features (Self-Optimizing Memory)
+
+- **Usage-Based Learning** - Tracks which memories are accessed and how often
+- **Weighted Search** - Boosts frequently-used, high-value memories in results
+- **Feedback Loop** - Learns from user feedback to improve relevance over time
+- **Pattern Discovery** - Automatically identifies relationship patterns
+- **Self-Scheduling** - Background learning jobs analyze and optimize continuously
+- **Performance Analytics** - Insights on memory effectiveness and usage patterns
+
+
 
 ## Quick Start
 
@@ -74,11 +85,18 @@ CIRCUIT_BREAKER_THRESHOLD=5
 CIRCUIT_BREAKER_TIMEOUT=60000
 MAX_MEMORY_TEXT_LENGTH=10000
 CORS_ORIGIN=https://yourdomain.com,https://app.yourdomain.com
+
+# Metacognition/Learning (optional)
+ENABLE_LEARNING_SCHEDULER=true
+LEARNING_INTERVAL_HOURS=1
+LEARNING_AUTO_APPLY=false
 ```
 
 ## API Documentation
 
 See [CHANGELOG.md](./CHANGELOG.md) for v2.0 features and breaking changes.
+
+For complete metacognition API documentation with examples, see [METACOGNITION_API.md](./METACOGNITION_API.md).
 
 ### Health Checks
 
@@ -92,14 +110,22 @@ All endpoints require `X-API-Key` header.
 
 - `POST /api/v1/memories` - Create memory
 - `GET /api/v1/memories` - List memories
-- `GET /api/v1/memories/search` - Semantic search
-- `GET /api/v1/memories/:id` - Get memory by ID
+- `POST /api/v1/memories/search` - Semantic search (supports `weight_by_usage`, `decay_old_memories`, `learning_mode`, `min_helpfulness_score`)
+- `GET /api/v1/memories/:id` - Get memory by ID (tracks usage, returns learning metadata)
 - `PUT /api/v1/memories/:id` - Update memory
 - `DELETE /api/v1/memories/:id` - Delete memory
 
 ### Context Endpoints
 
 - `POST /api/v1/context` - Intelligent context retrieval
+
+### Metacognition Endpoints
+
+- `POST /api/v1/memories/:id/feedback` - Submit feedback on memory helpfulness
+- `GET /api/v1/memories/meta/patterns` - Analyze usage patterns and get insights
+- `POST /api/v1/learning/analyze` - Trigger learning analysis (discover patterns)
+- `POST /api/v1/learning/apply-suggestions` - Apply relationship suggestions
+- `GET /api/v1/learning/status` - Check learning system status
 
 ### Rate Limiting
 
@@ -188,5 +214,6 @@ MIT
 
 ## Version History
 
+- **v2.1.0** (2025-11-18) - Metacognition system (Phases 1-4) - Self-optimizing memory with usage tracking, weighted search, feedback loops, and automated learning
 - **v2.0.0** (2025-01-09) - Production-grade features
 - **v1.0.0** (2025-01-08) - Initial release
