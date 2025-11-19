@@ -8,7 +8,9 @@
       "Bash(npm install:*)",
       "Bash(curl:*)",
       "Bash(chmod:*)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(psql:*)",
+      "Bash(node run-migration.js:*)"
     ],
     "deny": [],
     "ask": []

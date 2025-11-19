@@ -28,11 +28,16 @@ import memoriesRouter from './routes/memories.js';
 import contextRouter from './routes/context.js';
 import healthRouter from './routes/health.js';
 import relationshipsRouter from './routes/relationships.js';
+import learningRouter from './routes/learning.js';
+import adminRouter from './routes/admin.js';
+import collaborationRouter from './routes/collaboration.js';
+import monitoringRouter from './routes/monitoring.js';
 
 // Utilities
 import { logger } from './utils/logger.js';
 import { Errors } from './utils/errors.js';
 import { testConnection } from './config/supabase.js';
+import { startLearningScheduler, stopLearningScheduler } from './services/learningScheduler.js';
 
 // Load environment variables
 dotenv.config();
@@ -116,6 +121,16 @@ app.get("/", (_req: Request, res: Response) => {
       "Prometheus Metrics",
       "Request Validation",
       "AI-Powered Relationship Detection",
+      "Self-Optimizing Memory (Metacognition)",
+      "Usage-Based Learning",
+      "Multi-Agent Collaboration (Phase 3)",
+      "Agent Reputation System",
+      "Conflict Detection & Resolution",
+      "Knowledge Synthesis",
+      "Cross-Agent Learning Transfer",
+      "Comprehensive Audit Logging",
+      "SLA Tracking & Monitoring",
+      "Graph Integrity Verification",
     ],
     status: "healthy",
     environment: NODE_ENV,
@@ -125,6 +140,10 @@ app.get("/", (_req: Request, res: Response) => {
 // API v1 routes (with authentication and rate limiting)
 app.use('/api/v1/memories', memoriesRouter);
 app.use('/api/v1/relationships', relationshipsRouter);
+app.use('/api/v1/learning', learningRouter);
+app.use('/api/v1/admin', adminRouter);
+app.use('/api/v1/collaboration', collaborationRouter);
+app.use('/api/v1/monitoring', monitoringRouter);
 app.use('/api/v1', contextRouter);
 app.get('/api/v1/rate-limit', apiKeyRateLimit, rateLimitStatusEndpoint);
 
@@ -161,8 +180,24 @@ async function startServer() {
           structuredLogging: true,
           healthChecks: true,
           metrics: true,
+          metacognition: true,
         },
       });
+
+      // Start learning scheduler (runs every hour, auto-apply disabled by default)
+      const enableLearning = process.env.ENABLE_LEARNING_SCHEDULER !== 'false';
+      const learningInterval = parseInt(process.env.LEARNING_INTERVAL_HOURS || '1');
+      const learningAutoApply = process.env.LEARNING_AUTO_APPLY === 'true';
+
+      if (enableLearning) {
+        startLearningScheduler(learningInterval, learningAutoApply);
+        logger.info('Learning scheduler started', {
+          intervalHours: learningInterval,
+          autoApply: learningAutoApply,
+        });
+      } else {
+        logger.info('Learning scheduler disabled (set ENABLE_LEARNING_SCHEDULER=true to enable)');
+      }
     });
   } catch (error: any) {
     logger.error('Failed to start server', {
@@ -185,6 +220,9 @@ async function gracefulShutdown(signal: string) {
   isShuttingDown = true;
 
   logger.info(`Received ${signal}, starting graceful shutdown...`);
+
+  // Stop learning scheduler
+  stopLearningScheduler();
 
   // Stop accepting new connections
   if (server) {

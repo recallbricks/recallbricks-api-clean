@@ -76,7 +76,7 @@ router.use(authenticateApiKey);
 router.post('/', async (req: Request, res: Response): Promise<void> => {
   try {
     const user = req.user!;
-    const { text, source, project_id, tags, metadata }: CreateMemoryRequest = req.body;
+    const { text, source, project_id, tags, metadata, agent_id }: CreateMemoryRequest & { agent_id?: string } = req.body;
 
    // Extract key information (optional)
     const extractedText = await extractKeyInfo(text);
@@ -93,7 +93,8 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
       metadata: {
         ...metadata,
         original_text: text,
-        extracted: !!openai
+        extracted: !!openai,
+        ...(agent_id ? { contributed_by_agent: agent_id } : {})
       },
       embedding: embedding ? `[${embedding.join(',')}]` : null,
     };
@@ -105,6 +106,29 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
       .single();
 
     if (error) throw error;
+
+    // PHASE 3: Record agent contribution if agent_id provided
+    if (agent_id && data?.id) {
+      const { error: contribError } = await supabase
+        .from('agent_memory_contributions')
+        .insert({
+          memory_id: data.id,
+          agent_id: agent_id,
+          contribution_type: 'create',
+          confidence: 0.8,
+          validation_status: 'accepted'
+        });
+
+      if (contribError) {
+        console.error('Failed to record agent contribution:', contribError);
+      } else {
+        // Update agent stats
+        await supabase.rpc('update_agent_contribution_stats', {
+          p_agent_id: agent_id,
+          p_contribution_accepted: true
+        });
+      }
+    }
 
     // Trigger async relationship detection (fire-and-forget)
     if (data?.id && relationshipConfig.asyncExecution) {
@@ -219,12 +243,22 @@ router.get('/search', async (req: Request, res: Response): Promise<void> => {
 
 /**
  * POST /api/v1/memories/search
- * Semantic search using vector similarity (POST version for body params)
+ * Semantic search using vector similarity with optional usage-based weighting
+ * Falls back to full-text search if embeddings are not available
+ * PHASE 2: Uses adaptive per-user weights
  */
 router.post('/search', async (req: Request, res: Response): Promise<void> => {
   try {
     const user = req.user!;
-    const { query, limit = 10 } = req.body;
+    const {
+      query,
+      limit = 10,
+      weight_by_usage = false,
+      decay_old_memories = false,
+      learning_mode = false,
+      min_helpfulness_score,
+      adaptive_weights = true // Phase 2: Enable adaptive weighting
+    } = req.body;
 
     if (!query || typeof query !== 'string') {
       res.status(400).json({
@@ -234,21 +268,216 @@ router.post('/search', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    // PHASE 2: Fetch user's adaptive learning weights
+    let userWeights = {
+      usage_weight: 0.3,
+      recency_weight: 0.2,
+      helpfulness_weight: 0.5,
+      relationship_weight: 0.2
+    };
+
+    if (adaptive_weights) {
+      const { data: learningParams } = await supabase
+        .from('user_learning_params')
+        .select('usage_weight, recency_weight, helpfulness_weight, relationship_weight')
+        .eq('user_id', user.id)
+        .single();
+
+      if (learningParams) {
+        userWeights = learningParams;
+      }
+    }
+
     const queryEmbedding = await generateEmbedding(query);
 
-    const { data, error } = await supabase.rpc('match_memories', {
-      query_embedding: JSON.stringify(queryEmbedding),
-      match_threshold: 0.5,
-      match_count: parseInt(String(limit)),
-      filter_user_id: user.id
-    });
+    // Fetch more results if weighting is enabled (we'll re-rank and trim)
+    const fetchLimit = weight_by_usage || decay_old_memories ? limit * 3 : limit;
 
-    if (error) throw error;
+    let memories: any[] = [];
+    let usedFallback = false;
+
+    // If embeddings are not available, fall back to full-text search
+    if (!queryEmbedding) {
+      usedFallback = true;
+
+      // Use ILIKE for simple text matching (works reliably without tsvector column)
+      const { data, error } = await supabase
+        .from('memories')
+        .select('*')
+        .eq('user_id', user.id)
+        .ilike('text', `%${query}%`)
+        .limit(parseInt(String(fetchLimit)));
+
+      if (error) throw error;
+
+      memories = data || [];
+
+      // If weight_by_usage is enabled, fetch analytics and apply weighting
+      if (weight_by_usage && memories.length > 0) {
+        const memoryIds = memories.map(m => m.id);
+        const { data: analyticsData } = await supabase
+          .from('memory_analytics')
+          .select('id, usage_count, helpfulness_score, access_frequency')
+          .in('id', memoryIds);
+
+        const analyticsMap = new Map(
+          (analyticsData || []).map((a: any) => [a.id, a])
+        );
+
+        // Apply text search weighting based on usage and helpfulness
+        memories = memories.map(memory => {
+          const analytics = analyticsMap.get(memory.id);
+          const usageCount = analytics?.usage_count || 0;
+          const helpfulness = analytics?.helpfulness_score || 0.5;
+
+          // Simple scoring: (1 + usage_count) * helpfulness_score
+          // Add 1 to usage_count to avoid zero scores for new memories
+          const weightedScore = (1 + usageCount) * helpfulness;
+
+          return {
+            ...memory,
+            base_similarity: null, // No vector similarity in text search
+            weighted_score: weightedScore,
+            boosted_by_usage: usageCount > 5,
+            boosted_by_recency: false,
+            penalized_by_age: false,
+            usage_count: usageCount,
+            helpfulness_score: helpfulness,
+            access_frequency: analytics?.access_frequency || 'unused'
+          };
+        });
+
+        // Sort by weighted score
+        memories.sort((a, b) => b.weighted_score - a.weighted_score);
+        memories = memories.slice(0, limit);
+      }
+    } else {
+      // Use vector similarity search
+      const { data, error } = await supabase.rpc('match_memories', {
+        query_embedding: JSON.stringify(queryEmbedding),
+        match_threshold: 0.5,
+        match_count: parseInt(String(fetchLimit)),
+        filter_user_id: user.id
+      });
+
+      if (error) throw error;
+
+      memories = data || [];
+    }
+
+    // Apply metacognitive weighting if requested (skip if already done in fallback)
+    const needsWeighting = (weight_by_usage || decay_old_memories) &&
+                          !(usedFallback && weight_by_usage && !decay_old_memories);
+
+    if (needsWeighting && memories.length > 0) {
+      // Fetch analytics data for all memories
+      const memoryIds = memories.map((m: any) => m.id);
+      const { data: analyticsData } = await supabase
+        .from('memory_analytics')
+        .select('id, usage_count, last_accessed, helpfulness_score, recency_score, access_frequency')
+        .in('id', memoryIds);
+
+      const analyticsMap = new Map(
+        (analyticsData || []).map((a: any) => [a.id, a])
+      );
+
+      // Apply weighted scoring
+      memories = memories.map((memory: any) => {
+        const analytics = analyticsMap.get(memory.id);
+        const baseSimilarity = memory.similarity || 0;
+
+        // For fallback searches, use the already computed weighted_score as base
+        let weightedScore = usedFallback && memory.weighted_score
+          ? memory.weighted_score
+          : baseSimilarity;
+
+        let boostedByUsage = false;
+        let boostedByRecency = false;
+        let penalizedByAge = false;
+
+        if (analytics) {
+          // Apply usage-based weighting only if not already done in fallback
+          // PHASE 2: Use adaptive user weights
+          if (weight_by_usage && !usedFallback) {
+            const usageScore = Math.min(Math.log(analytics.usage_count + 1) / Math.log(100), 1.0);
+            const helpfulness = analytics.helpfulness_score || 0.5;
+            const recencyScore = analytics.recency_score || 0.5;
+
+            // Apply learned weights
+            weightedScore =
+              baseSimilarity * 0.4 + // Base similarity always counts
+              usageScore * userWeights.usage_weight +
+              recencyScore * userWeights.recency_weight +
+              helpfulness * userWeights.helpfulness_weight;
+
+            boostedByUsage = analytics.usage_count > 5;
+          }
+
+          // Apply recency boost/decay
+          if (decay_old_memories && analytics.last_accessed) {
+            const daysSinceAccess = analytics.recency_score !== null
+              ? (1 - analytics.recency_score) * 365 // Approximate days
+              : 365;
+
+            if (daysSinceAccess <= 7) {
+              // Recent memories get +20% boost
+              weightedScore *= 1.2;
+              boostedByRecency = true;
+            } else if (daysSinceAccess >= 90) {
+              // Stale memories get -30% penalty
+              weightedScore *= 0.7;
+              penalizedByAge = true;
+            }
+          }
+
+          // Filter by minimum helpfulness score if specified
+          if (min_helpfulness_score !== undefined) {
+            const helpfulness = analytics.helpfulness_score || 0.5;
+            if (helpfulness < min_helpfulness_score) {
+              weightedScore = 0; // Will be filtered out
+            }
+          }
+        }
+
+        return {
+          ...memory,
+          base_similarity: baseSimilarity,
+          weighted_score: weightedScore,
+          boosted_by_usage: boostedByUsage,
+          boosted_by_recency: boostedByRecency,
+          penalized_by_age: penalizedByAge,
+          usage_count: analytics?.usage_count || 0,
+          helpfulness_score: analytics?.helpfulness_score || 0.5,
+          access_frequency: analytics?.access_frequency || 'unused'
+        };
+      });
+
+      // Sort by weighted score and trim to limit
+      memories.sort((a: any, b: any) => b.weighted_score - a.weighted_score);
+      memories = memories.filter((m: any) => m.weighted_score > 0).slice(0, limit);
+
+      // Track which results were used in learning mode
+      if (learning_mode) {
+        memories.forEach((memory: any) => {
+          supabase.rpc('increment_memory_usage', {
+            p_memory_id: memory.id,
+            p_context: 'search_result'
+          }).then(({ error }) => {
+            if (error) {
+              console.error('Failed to track learning mode usage:', error);
+            }
+          });
+        });
+      }
+    }
 
     res.json({
-      memories: data || [],
-      count: data?.length || 0,
-      query
+      memories,
+      count: memories.length,
+      query,
+      weighted: weight_by_usage || decay_old_memories,
+      learning_mode,
+      search_method: usedFallback ? 'text_search' : 'vector_similarity'
     });
   } catch (error: any) {
     console.error('Error searching memories:', error);
@@ -384,14 +613,238 @@ router.get('/test-extraction', async (req: Request, res: Response): Promise<void
 });
 
 /**
+ * GET /api/v1/memories/predict
+ * Phase 2: Predictive memory prefetching
+ * Predicts which memories will likely be needed next based on patterns
+ */
+router.get('/predict', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const user = req.user!;
+    const {
+      current_context,
+      recent_memories,
+      limit = 10
+    } = req.query;
+
+    // Parse recent_memories (comma-separated IDs or JSON array)
+    let recentIds: string[] = [];
+    if (typeof recent_memories === 'string') {
+      try {
+        recentIds = JSON.parse(recent_memories);
+      } catch {
+        recentIds = recent_memories.split(',').map(id => id.trim()).filter(id => id);
+      }
+    }
+
+    const predictions: any[] = [];
+    const predictionMap = new Map<string, { confidence: number; reasons: string[]; related_to: string[] }>();
+
+    // 1. Co-access pattern predictions
+    if (recentIds.length > 0) {
+      // Fetch access patterns for recent memories
+      const { data: recentMemories } = await supabase
+        .from('memories')
+        .select('id, access_pattern')
+        .in('id', recentIds)
+        .eq('user_id', user.id);
+
+      (recentMemories || []).forEach((memory: any) => {
+        const accessPattern = memory.access_pattern || {};
+        const coAccessed = accessPattern.co_accessed_with || [];
+
+        coAccessed.forEach((coAccessedId: string) => {
+          if (recentIds.includes(coAccessedId)) return; // Skip already accessed
+
+          if (!predictionMap.has(coAccessedId)) {
+            predictionMap.set(coAccessedId, {
+              confidence: 0,
+              reasons: [],
+              related_to: []
+            });
+          }
+
+          const prediction = predictionMap.get(coAccessedId)!;
+          prediction.confidence += 0.3; // Boost confidence for co-access
+          prediction.reasons.push('frequently_accessed_with');
+          prediction.related_to.push(memory.id);
+        });
+      });
+    }
+
+    // 2. Relationship-based predictions
+    if (recentIds.length > 0) {
+      const { data: relationships } = await supabase
+        .from('memory_relationships')
+        .select('memory_id, related_memory_id, relationship_type, strength')
+        .or(recentIds.map(id => `memory_id.eq.${id}`).join(','))
+        .eq('memory_id', recentIds[0]); // Simplified query
+
+      // Better query: use in() for multiple IDs
+      const { data: relatedMemories } = await supabase
+        .from('memory_relationships')
+        .select('memory_id, related_memory_id, relationship_type, strength')
+        .in('memory_id', recentIds);
+
+      (relatedMemories || []).forEach((rel: any) => {
+        const targetId = rel.related_memory_id;
+        if (recentIds.includes(targetId)) return;
+
+        if (!predictionMap.has(targetId)) {
+          predictionMap.set(targetId, {
+            confidence: 0,
+            reasons: [],
+            related_to: []
+          });
+        }
+
+        const prediction = predictionMap.get(targetId)!;
+        const relationshipBoost = rel.strength || 0.5;
+        prediction.confidence += relationshipBoost * 0.4;
+        prediction.reasons.push(`${rel.relationship_type}_relationship`);
+        prediction.related_to.push(rel.memory_id);
+      });
+    }
+
+    // 3. Temporal pattern predictions
+    const currentHour = new Date().getHours();
+    const currentDay = new Date().toLocaleDateString('en-US', { weekday: 'long' });
+
+    const { data: temporalPatterns } = await supabase
+      .from('temporal_patterns')
+      .select('*')
+      .eq('user_id', user.id)
+      .gte('confidence', 0.5)
+      .order('confidence', { ascending: false });
+
+    (temporalPatterns || []).forEach((pattern: any) => {
+      const patternData = pattern.pattern_data || {};
+
+      // Check if pattern matches current time
+      let matchesTime = false;
+      if (pattern.pattern_type === 'hourly' && patternData.hour === currentHour) {
+        matchesTime = true;
+      } else if (pattern.pattern_type === 'daily' && patternData.day === currentDay) {
+        matchesTime = true;
+      } else if (pattern.pattern_type === 'sequence' && recentIds.length > 0) {
+        // Check if recent memories match sequence start
+        const sequence = patternData.sequence || [];
+        if (sequence.length > 0 && recentIds.includes(sequence[0])) {
+          matchesTime = true;
+        }
+      }
+
+      if (matchesTime) {
+        const predictedMemories = patternData.memories || [];
+        predictedMemories.forEach((memId: string) => {
+          if (recentIds.includes(memId)) return;
+
+          if (!predictionMap.has(memId)) {
+            predictionMap.set(memId, {
+              confidence: 0,
+              reasons: [],
+              related_to: []
+            });
+          }
+
+          const prediction = predictionMap.get(memId)!;
+          prediction.confidence += pattern.confidence * 0.3;
+          prediction.reasons.push(`temporal_pattern_${pattern.pattern_type}`);
+        });
+      }
+    });
+
+    // 4. Context-based predictions (if context provided)
+    if (current_context && typeof current_context === 'string') {
+      // Use existing search to find contextually relevant memories
+      const contextEmbedding = await generateEmbedding(current_context);
+      if (contextEmbedding) {
+        const { data: contextMatches } = await supabase.rpc('match_memories', {
+          query_embedding: JSON.stringify(contextEmbedding),
+          match_threshold: 0.6,
+          match_count: 20,
+          filter_user_id: user.id
+        });
+
+        (contextMatches || []).forEach((match: any) => {
+          if (recentIds.includes(match.id)) return;
+
+          if (!predictionMap.has(match.id)) {
+            predictionMap.set(match.id, {
+              confidence: 0,
+              reasons: [],
+              related_to: []
+            });
+          }
+
+          const prediction = predictionMap.get(match.id)!;
+          prediction.confidence += match.similarity * 0.4;
+          prediction.reasons.push('context_similarity');
+        });
+      }
+    }
+
+    // 5. Fetch memory details for predictions
+    const predictedIds = Array.from(predictionMap.keys());
+    if (predictedIds.length > 0) {
+      const { data: memoryDetails } = await supabase
+        .from('memory_analytics')
+        .select('id, text, helpfulness_score, usage_count, access_frequency')
+        .in('id', predictedIds);
+
+      const memoryMap = new Map((memoryDetails || []).map((m: any) => [m.id, m]));
+
+      predictionMap.forEach((pred, memId) => {
+        const memory = memoryMap.get(memId);
+        if (memory) {
+          // Boost confidence by helpfulness
+          const finalConfidence = Math.min(
+            pred.confidence * (0.5 + memory.helpfulness_score * 0.5),
+            1.0
+          );
+
+          predictions.push({
+            memory_id: memId,
+            text: memory.text?.substring(0, 150) + '...',
+            confidence: Math.round(finalConfidence * 100) / 100,
+            reasons: [...new Set(pred.reasons)],
+            related_to: [...new Set(pred.related_to)],
+            helpfulness_score: memory.helpfulness_score,
+            usage_count: memory.usage_count
+          });
+        }
+      });
+    }
+
+    // Sort by confidence and limit results
+    predictions.sort((a, b) => b.confidence - a.confidence);
+    const topPredictions = predictions.slice(0, parseInt(String(limit)));
+
+    res.json({
+      predictions: topPredictions,
+      count: topPredictions.length,
+      context: current_context || null,
+      recent_memories: recentIds
+    });
+  } catch (error: any) {
+    console.error('Error predicting memories:', error);
+    res.status(500).json({
+      error: 'Internal Server Error',
+      message: error.message || 'Failed to predict memories.'
+    });
+  }
+});
+
+/**
  * GET /api/v1/memories/:id
- * Get a single memory by ID
+ * Get a single memory by ID (with usage tracking)
  */
 router.get('/:id', async (req: Request, res: Response): Promise<void> => {
   try {
     const user = req.user!;
     const { id } = req.params;
+    const context = req.query.context as string | undefined;
 
+    // First, fetch the memory
     const { data, error } = await supabase
       .from('memories')
       .select('*')
@@ -407,7 +860,51 @@ router.get('/:id', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    res.json(data);
+    // Increment memory usage before returning
+    await supabase.rpc('increment_memory_usage', {
+      p_memory_id: id,
+      p_context: context || null
+    });
+
+    // Fetch learning metadata from analytics view
+    const { data: analyticsData } = await supabase
+      .from('memory_analytics')
+      .select('access_frequency, recency_score, days_since_access, relationship_count')
+      .eq('id', id)
+      .single();
+
+    // PHASE 3: Fetch contributor agents
+    const { data: contributors } = await supabase
+      .from('agent_memory_contributions')
+      .select(`
+        id,
+        contribution_type,
+        confidence,
+        validation_status,
+        created_at,
+        agent_profiles!agent_memory_contributions_agent_id_fkey(
+          id,
+          agent_name,
+          agent_type,
+          reputation_score
+        )
+      `)
+      .eq('memory_id', id)
+      .order('created_at', { ascending: false });
+
+    // Enhance response with learning metadata and contributors
+    const enhancedMemory = {
+      ...data,
+      learning_metadata: analyticsData ? {
+        access_frequency: analyticsData.access_frequency,
+        recency_score: analyticsData.recency_score,
+        days_since_access: analyticsData.days_since_access,
+        relationship_count: analyticsData.relationship_count
+      } : undefined,
+      contributors: contributors || []
+    };
+
+    res.json(enhancedMemory);
   } catch (error: any) {
     console.error('Error getting memory:', error);
     res.status(500).json({
@@ -491,6 +988,429 @@ router.put('/:id', async (req: Request, res: Response): Promise<void> => {
     res.status(500).json({
       error: 'Internal Server Error',
       message: error.message || 'Failed to update memory.'
+    });
+  }
+});
+
+/**
+ * POST /api/v1/memories/:id/feedback
+ * Submit feedback on memory helpfulness to improve future recommendations
+ */
+router.post('/:id/feedback', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const user = req.user!;
+    const { id } = req.params;
+    const { helpful, context, user_satisfaction } = req.body;
+
+    if (typeof helpful !== 'boolean') {
+      res.status(400).json({
+        error: 'Bad Request',
+        message: 'Field "helpful" must be a boolean.'
+      });
+      return;
+    }
+
+    // Validate user_satisfaction if provided
+    if (user_satisfaction !== undefined) {
+      const satisfaction = parseFloat(user_satisfaction);
+      if (isNaN(satisfaction) || satisfaction < 0 || satisfaction > 1) {
+        res.status(400).json({
+          error: 'Bad Request',
+          message: 'Field "user_satisfaction" must be a number between 0.0 and 1.0.'
+        });
+        return;
+      }
+    }
+
+    // Verify memory belongs to user
+    const { data: memory, error: fetchError } = await supabase
+      .from('memories')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .single();
+
+    if (fetchError || !memory) {
+      res.status(404).json({
+        error: 'Not Found',
+        message: 'Memory not found.'
+      });
+      return;
+    }
+
+    // Update helpfulness score using the database function
+    const { data: updatedScore, error } = await supabase.rpc('update_helpfulness_score', {
+      p_memory_id: id,
+      p_helpful: helpful,
+      p_user_satisfaction: user_satisfaction || null
+    });
+
+    if (error) throw error;
+
+    // PHASE 2: Update user's adaptive learning parameters based on feedback
+    await supabase.rpc('update_learning_params', {
+      p_user_id: user.id,
+      p_search_satisfaction: user_satisfaction || null,
+      p_helpful_feedback: helpful
+    });
+
+    // Log feedback context if provided
+    if (context) {
+      const { data: currentMemory } = await supabase
+        .from('memories')
+        .select('access_pattern')
+        .eq('id', id)
+        .single();
+
+      if (currentMemory) {
+        const accessPattern = currentMemory.access_pattern || {};
+        accessPattern.feedback_contexts = accessPattern.feedback_contexts || [];
+        accessPattern.feedback_contexts.push({
+          context,
+          helpful,
+          timestamp: new Date().toISOString()
+        });
+
+        await supabase
+          .from('memories')
+          .update({ access_pattern: accessPattern })
+          .eq('id', id);
+      }
+    }
+
+    res.json({
+      success: true,
+      memory_id: id,
+      new_helpfulness_score: updatedScore,
+      feedback: {
+        helpful,
+        context: context || null,
+        user_satisfaction: user_satisfaction || null
+      }
+    });
+  } catch (error: any) {
+    console.error('Error processing feedback:', error);
+    res.status(500).json({
+      error: 'Internal Server Error',
+      message: error.message || 'Failed to process feedback.'
+    });
+  }
+});
+
+/**
+ * POST /api/v1/memories/suggest
+ * Phase 2: Context-aware suggestions
+ * Proactively suggests relevant memories BEFORE the user asks
+ */
+router.post('/suggest', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const user = req.user!;
+    const {
+      context,
+      include_reasoning = true,
+      limit = 5,
+      min_confidence = 0.6
+    } = req.body;
+
+    if (!context || typeof context !== 'string') {
+      res.status(400).json({
+        error: 'Bad Request',
+        message: 'Field "context" is required.'
+      });
+      return;
+    }
+
+    // Get user's learning parameters for personalized weighting
+    const { data: userParams } = await supabase
+      .from('user_learning_params')
+      .select('*')
+      .eq('user_id', user.id)
+      .single();
+
+    const weights = userParams || {
+      usage_weight: 0.3,
+      recency_weight: 0.2,
+      helpfulness_weight: 0.5
+    };
+
+    // 1. Vector similarity search
+    const contextEmbedding = await generateEmbedding(context);
+    let suggestions: any[] = [];
+
+    if (contextEmbedding) {
+      const { data: semanticMatches } = await supabase.rpc('match_memories', {
+        query_embedding: JSON.stringify(contextEmbedding),
+        match_threshold: 0.5,
+        match_count: limit * 3, // Fetch more for re-ranking
+        filter_user_id: user.id
+      });
+
+      suggestions = semanticMatches || [];
+    } else {
+      // Fallback to text search if embeddings not available
+      const { data: textMatches } = await supabase
+        .from('memories')
+        .select('*')
+        .eq('user_id', user.id)
+        .ilike('text', `%${context.split(' ').slice(0, 3).join('%')}%`)
+        .limit(limit * 3);
+
+      suggestions = textMatches || [];
+    }
+
+    // 2. Enhance with analytics data
+    if (suggestions.length > 0) {
+      const memoryIds = suggestions.map((m: any) => m.id);
+      const { data: analyticsData } = await supabase
+        .from('memory_analytics')
+        .select('*')
+        .in('id', memoryIds);
+
+      const analyticsMap = new Map(
+        (analyticsData || []).map((a: any) => [a.id, a])
+      );
+
+      // 3. Calculate suggestion scores using learned weights
+      suggestions = suggestions.map((memory: any) => {
+        const analytics = analyticsMap.get(memory.id);
+        const baseSimilarity = memory.similarity || 0.5;
+
+        // Normalize usage count to 0-1 scale (log scale)
+        const usageCount = analytics?.usage_count || 0;
+        const normalizedUsage = Math.min(Math.log(usageCount + 1) / Math.log(100), 1.0);
+
+        // Get recency score
+        const recencyScore = analytics?.recency_score || 0.5;
+
+        // Get helpfulness score
+        const helpfulnessScore = analytics?.helpfulness_score || 0.5;
+
+        // Calculate weighted suggestion score
+        const suggestionScore =
+          baseSimilarity * 0.4 + // Base semantic match
+          normalizedUsage * weights.usage_weight +
+          recencyScore * weights.recency_weight +
+          helpfulnessScore * weights.helpfulness_weight;
+
+        return {
+          memory_id: memory.id,
+          text: memory.text,
+          similarity: baseSimilarity,
+          suggestion_score: suggestionScore,
+          analytics: {
+            usage_count: usageCount,
+            helpfulness_score: helpfulnessScore,
+            recency_score: recencyScore,
+            access_frequency: analytics?.access_frequency || 'unused',
+            days_since_access: analytics?.days_since_access
+          },
+          reasoning: include_reasoning ? {
+            semantic_match: baseSimilarity > 0.7 ? 'high' : baseSimilarity > 0.5 ? 'medium' : 'low',
+            frequently_used: usageCount > 10,
+            recently_accessed: recencyScore > 0.8,
+            high_helpfulness: helpfulnessScore > 0.7,
+            weights_applied: weights
+          } : undefined
+        };
+      });
+
+      // 4. Filter by minimum confidence and sort
+      suggestions = suggestions
+        .filter((s: any) => s.suggestion_score >= min_confidence)
+        .sort((a: any, b: any) => b.suggestion_score - a.suggestion_score)
+        .slice(0, limit);
+
+      // 5. Check for related memories to enhance suggestions
+      if (suggestions.length > 0) {
+        const topIds = suggestions.map((s: any) => s.memory_id);
+        const { data: relationships } = await supabase
+          .from('memory_relationships')
+          .select('memory_id, related_memory_id, relationship_type, strength')
+          .in('memory_id', topIds)
+          .gte('strength', 0.6);
+
+        // Add relationship info to suggestions
+        const relationshipMap = new Map<string, any[]>();
+        (relationships || []).forEach((rel: any) => {
+          if (!relationshipMap.has(rel.memory_id)) {
+            relationshipMap.set(rel.memory_id, []);
+          }
+          relationshipMap.get(rel.memory_id)!.push({
+            related_memory_id: rel.related_memory_id,
+            relationship_type: rel.relationship_type,
+            strength: rel.strength
+          });
+        });
+
+        suggestions = suggestions.map((s: any) => ({
+          ...s,
+          related_memories: relationshipMap.get(s.memory_id) || []
+        }));
+      }
+    }
+
+    res.json({
+      suggestions,
+      count: suggestions.length,
+      context,
+      weights_used: weights,
+      min_confidence
+    });
+  } catch (error: any) {
+    console.error('Error generating suggestions:', error);
+    res.status(500).json({
+      error: 'Internal Server Error',
+      message: error.message || 'Failed to generate suggestions.'
+    });
+  }
+});
+
+/**
+ * GET /api/v1/memories/meta/patterns
+ * Analyze usage patterns and return learning insights
+ */
+router.get('/meta/patterns', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const user = req.user!;
+    const { days = 30 } = req.query;
+
+    // Get all memories with analytics data
+    const { data: analytics, error: analyticsError } = await supabase
+      .from('memory_analytics')
+      .select('*')
+      .eq('user_id', user.id);
+
+    if (analyticsError) throw analyticsError;
+
+    const memories = analytics || [];
+
+    // 1. Most useful tags
+    const tagStats = new Map<string, { count: number; totalHelpfulness: number; totalUsage: number }>();
+
+    memories.forEach((memory: any) => {
+      (memory.tags || []).forEach((tag: string) => {
+        if (!tagStats.has(tag)) {
+          tagStats.set(tag, { count: 0, totalHelpfulness: 0, totalUsage: 0 });
+        }
+        const stats = tagStats.get(tag)!;
+        stats.count++;
+        stats.totalHelpfulness += memory.helpfulness_score || 0.5;
+        stats.totalUsage += memory.usage_count || 0;
+      });
+    });
+
+    const mostUsefulTags = Array.from(tagStats.entries())
+      .map(([tag, stats]) => ({
+        tag,
+        avg_helpfulness: stats.totalHelpfulness / stats.count,
+        usage_count: stats.totalUsage
+      }))
+      .sort((a, b) => b.avg_helpfulness - a.avg_helpfulness)
+      .slice(0, 10);
+
+    // 2. Find frequently co-accessed memories (from access_pattern data)
+    const coAccessMap = new Map<string, number>();
+
+    memories.forEach((memory: any) => {
+      const accessPattern = memory.access_pattern || {};
+      const coAccessed = accessPattern.co_accessed_with || [];
+      coAccessed.forEach((otherId: string) => {
+        const key = [memory.id, otherId].sort().join('|');
+        coAccessMap.set(key, (coAccessMap.get(key) || 0) + 1);
+      });
+    });
+
+    const frequentlyAccessedTogether = Array.from(coAccessMap.entries())
+      .map(([key, count]) => {
+        const [id1, id2] = key.split('|');
+        return {
+          memory_id_1: id1,
+          memory_id_2: id2,
+          co_access_count: count
+        };
+      })
+      .filter(pair => pair.co_access_count >= 3)
+      .sort((a, b) => b.co_access_count - a.co_access_count)
+      .slice(0, 20);
+
+    // 3. Underutilized memories (low usage, high age)
+    const underutilizedMemories = memories
+      .filter((m: any) => (m.days_since_access || 0) > 90 || m.usage_count === 0)
+      .map((m: any) => ({
+        id: m.id,
+        text: m.text?.substring(0, 100) + '...',
+        days_since_access: m.days_since_access || 0,
+        usage_count: m.usage_count || 0
+      }))
+      .sort((a, b) => b.days_since_access - a.days_since_access)
+      .slice(0, 10);
+
+    // 4. Access time patterns (requires more detailed access_pattern data)
+    const hourlyDistribution: Record<number, number> = {};
+    const dailyDistribution: Record<string, number> = {};
+
+    // This would require storing timestamps in access_pattern
+    // For now, return empty patterns
+    for (let i = 0; i < 24; i++) {
+      hourlyDistribution[i] = 0;
+    }
+
+    // 5. Optimal relationship types (based on helpfulness of related memories)
+    const { data: relationships, error: relError } = await supabase
+      .from('memory_relationships')
+      .select('*, memories!memory_relationships_memory_id_fkey(helpfulness_score)')
+      .eq('memories.user_id', user.id);
+
+    const relationshipTypeStats = new Map<string, { count: number; totalHelpfulness: number }>();
+
+    (relationships || []).forEach((rel: any) => {
+      const type = rel.relationship_type;
+      const helpfulness = rel.memories?.helpfulness_score || 0.5;
+
+      if (!relationshipTypeStats.has(type)) {
+        relationshipTypeStats.set(type, { count: 0, totalHelpfulness: 0 });
+      }
+      const stats = relationshipTypeStats.get(type)!;
+      stats.count++;
+      stats.totalHelpfulness += helpfulness;
+    });
+
+    const optimalRelationshipTypes: Record<string, number> = {};
+    relationshipTypeStats.forEach((stats, type) => {
+      optimalRelationshipTypes[type] = stats.totalHelpfulness / stats.count;
+    });
+
+    // 6. Summary statistics
+    const totalMemories = memories.length;
+    const totalAccesses = memories.reduce((sum: number, m: any) => sum + (m.usage_count || 0), 0);
+    const avgHelpfulness = memories.length > 0
+      ? memories.reduce((sum: number, m: any) => sum + (m.helpfulness_score || 0.5), 0) / memories.length
+      : 0.5;
+    const activeMemories = memories.filter((m: any) => (m.days_since_access || 999) <= 30).length;
+    const staleMemories = memories.filter((m: any) => (m.days_since_access || 0) > 90).length;
+
+    res.json({
+      most_useful_tags: mostUsefulTags,
+      frequently_accessed_together: frequentlyAccessedTogether,
+      underutilized_memories: underutilizedMemories,
+      access_time_patterns: {
+        hourly_distribution: hourlyDistribution,
+        daily_distribution: dailyDistribution
+      },
+      optimal_relationship_types: optimalRelationshipTypes,
+      summary: {
+        total_memories: totalMemories,
+        total_accesses: totalAccesses,
+        avg_helpfulness: avgHelpfulness,
+        active_memories: activeMemories,
+        stale_memories: staleMemories
+      }
+    });
+  } catch (error: any) {
+    console.error('Error analyzing patterns:', error);
+    res.status(500).json({
+      error: 'Internal Server Error',
+      message: error.message || 'Failed to analyze patterns.'
     });
   }
 });
