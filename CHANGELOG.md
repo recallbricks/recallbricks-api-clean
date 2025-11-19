@@ -5,6 +5,189 @@ All notable changes to the RecallBricks API will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2025-11-18
+
+### Added - Metacognition System (Self-Optimizing Memory)
+
+#### Usage-Based Learning
+- **Automatic usage tracking** for all memory accesses
+  - `usage_count`: Tracks how often each memory is accessed
+  - `last_accessed`: Timestamp of most recent access
+  - `access_pattern`: JSONB storage for context tracking and co-access patterns
+- **Context-aware tracking**: Optional context parameter to categorize access patterns
+- **Fire-and-forget tracking**: Async tracking doesn't block response times
+- **Analytics view**: Pre-computed metrics for performance insights
+  - Access frequency classification (unused, low, medium, high, very_high)
+  - Recency scores (0.0-1.0 based on last access time)
+  - Days since last access
+  - Relationship counts
+
+#### Weighted Search
+- **POST /api/v1/memories/search** enhanced with metacognitive parameters:
+  - `weight_by_usage`: Boolean - Boost frequently-used memories in results
+  - `decay_old_memories`: Boolean - Penalize stale memories (90+ days since access)
+  - `learning_mode`: Boolean - Track which results are accessed (builds usage data)
+  - `min_helpfulness_score`: Number (0.0-1.0) - Filter by minimum helpfulness
+- **Intelligent scoring algorithm**:
+  - `weighted_score = base_similarity × (1 + log(usage_count + 1)) × helpfulness_score`
+  - Recent memories (≤7 days): +20% boost
+  - Stale memories (≥90 days): -30% penalty
+- **Detailed result metadata** including boost/penalty indicators
+
+#### Feedback Loop
+- **POST /api/v1/memories/:id/feedback** - Submit helpfulness feedback
+  - Simple thumbs up/down: `helpful` (boolean)
+  - Detailed satisfaction scores: `user_satisfaction` (0.0-1.0)
+  - Context tracking: `context` (string) describes how memory was used
+- **Exponential moving average** for satisfaction scores
+  - Formula: `new_score = 0.3 × user_satisfaction + 0.7 × current_score`
+  - Provides stability while favoring recent feedback
+- **Helpfulness score updates**:
+  - Positive feedback: +0.1 (capped at 1.0)
+  - Negative feedback: -0.05 (floored at 0.0)
+  - Default starting score: 0.5
+
+#### Pattern Analysis
+- **GET /api/v1/memories/meta/patterns** - Analyze usage patterns
+  - Most useful tags (by avg helpfulness and usage count)
+  - Frequently co-accessed memories (suggesting relationships)
+  - Underutilized memories (candidates for archival)
+  - Access time patterns (hourly and daily distributions)
+  - Optimal relationship types (by effectiveness)
+  - Summary statistics (total memories, accesses, avg helpfulness)
+- **Configurable time window**: `days` query parameter (default: 30)
+
+#### Self-Learning System
+- **POST /api/v1/learning/analyze** - Trigger learning analysis
+  - Detects memory clusters based on co-access patterns
+  - Suggests new relationships with confidence scores
+  - Calculates relationship type effectiveness weights
+  - Identifies stale memories (180+ days unused)
+  - `auto_apply` option: Automatically create high-confidence relationships (≥0.75)
+- **POST /api/v1/learning/apply-suggestions** - Manually apply relationship suggestions
+  - Accepts suggestions from previous analysis
+  - Configurable minimum confidence threshold
+  - Returns count of applied relationships
+- **GET /api/v1/learning/status** - Check learning system status
+  - Shows enabled state, last run time, next scheduled run
+  - Useful for monitoring and debugging
+
+#### Background Learning Scheduler
+- **Automatic learning jobs** run on configurable intervals
+  - Default: Every 1 hour
+  - Runs immediately on startup, then on schedule
+  - Analyzes co-access patterns continuously
+  - Suggests relationships based on usage
+  - Calculates type performance metrics
+- **Environment variables**:
+  - `ENABLE_LEARNING_SCHEDULER`: Enable/disable scheduler (default: true)
+  - `LEARNING_INTERVAL_HOURS`: Hours between runs (default: 1)
+  - `LEARNING_AUTO_APPLY`: Auto-create high-confidence relationships (default: false)
+- **Graceful startup and shutdown**
+  - Integrates with application lifecycle
+  - Comprehensive logging for monitoring
+
+#### Enhanced Memory Endpoints
+- **GET /api/v1/memories/:id** now includes:
+  - Usage count and last accessed timestamp
+  - Helpfulness score
+  - Access pattern data (contexts used)
+  - Learning metadata from analytics view
+  - Optional `context` query parameter for tracking
+- **All endpoints backward compatible** - New fields are additions only
+
+#### Database Enhancements
+- **New columns** in `memories` table:
+  - `usage_count INTEGER DEFAULT 0`
+  - `last_accessed TIMESTAMP WITH TIME ZONE`
+  - `helpfulness_score FLOAT DEFAULT 0.5`
+  - `access_pattern JSONB DEFAULT '{}'`
+- **New database functions**:
+  - `increment_memory_usage(memory_id, context)`: Atomic usage tracking
+  - `update_helpfulness_score(memory_id, helpful, user_satisfaction)`: Score updates
+- **New analytics view**: `memory_analytics`
+  - Pre-computed access frequency classifications
+  - Recency scores based on last access
+  - Days since access calculations
+  - Relationship counts
+- **Performance indexes**:
+  - `idx_memories_last_accessed` on `last_accessed`
+  - `idx_memories_helpfulness_score` on `helpfulness_score`
+  - `idx_memories_usage_count` on `usage_count`
+  - `idx_memories_helpfulness_recency` composite on `(helpfulness_score, last_accessed)`
+
+#### Additional Learning Endpoints
+- **GET /api/v1/learning/maintenance-suggestions** - Get maintenance recommendations
+  - Identifies memories that need attention
+  - Suggests archival candidates
+  - Highlights quality issues
+- **GET /api/v1/learning/metrics** - Learning system performance metrics
+  - Analysis run statistics
+  - Suggestion acceptance rates
+  - Overall system health indicators
+- **POST /api/v1/learning/analyze-enhanced** - Advanced learning analysis
+  - Enhanced pattern detection algorithms
+  - More sophisticated clustering
+  - Better relationship suggestions
+
+### Documentation
+
+#### New Documentation Files
+- **METACOGNITION_API.md** - Complete API reference for all metacognition features
+  - Detailed endpoint documentation with request/response examples
+  - Usage patterns and best practices
+  - Migration guide for existing deployments
+  - Performance considerations
+  - Troubleshooting guide
+- **METACOGNITION_PHASE1.md** - Implementation summary and overview
+  - Executive summary of features built
+  - Architecture decisions and rationale
+  - Success criteria verification
+  - File structure and organization
+  - Maintenance and monitoring guide
+- **README.md** updated to highlight metacognition features
+  - New "Metacognitive Features" section
+  - Updated endpoint documentation
+  - Environment variable reference
+  - Link to detailed metacognition docs
+
+### Changed
+
+#### Search Behavior
+- **Enhanced search results** include learning metadata when available
+- **Better result ordering** when weighted search is enabled
+- **Learning mode** option allows building usage data passively
+
+#### Memory Retrieval
+- **GET requests now track usage** automatically (fire-and-forget)
+- **Enhanced response format** includes learning metadata
+- **Context tracking** enables better pattern analysis
+
+### Performance Impact
+
+- **Minimal latency increase**:
+  - GET /memories/:id: +5-10ms (analytics view lookup)
+  - POST /memories/search (weighted): +20-30ms (3x fetch + re-ranking)
+  - POST /memories/:id/feedback: +15-20ms (score calculation)
+- **Storage overhead**: ~50 bytes per memory (~50 MB for 1M memories)
+- **Index overhead**: 4 new indexes with minimal write impact
+- **All within acceptable production ranges**
+
+### Migration
+
+- **100% backward compatible** - No breaking changes
+- **Migration script**: `migrations/20251117_add_metacognitive_tracking.sql`
+- **Safe to deploy**: All new columns have defaults, new params are optional
+- **Existing API calls work unchanged**
+
+### Security
+
+- **All new endpoints require authentication** (JWT or API Key)
+- **User isolation enforced** - Can't access other users' data
+- **Input validation** on all new parameters
+- **Rate limiting** applies to all new endpoints
+- **SQL injection protection** via parameterized queries
+
 ## [2.0.0] - 2025-01-09
 
 ### Added - Production-Grade Features

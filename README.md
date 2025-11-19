@@ -94,9 +94,11 @@ LEARNING_AUTO_APPLY=false
 
 ## API Documentation
 
-See [CHANGELOG.md](./CHANGELOG.md) for v2.0 features and breaking changes.
+**📚 [Complete API Reference](./API_REFERENCE.md)** - Comprehensive documentation for all endpoints
 
-For complete metacognition API documentation with examples, see [METACOGNITION_API.md](./METACOGNITION_API.md).
+**📋 [CHANGELOG](./CHANGELOG.md)** - v2.1 features and release notes
+
+**🧠 [Metacognition API](./METACOGNITION_API.md)** - Detailed self-optimizing memory documentation
 
 ### Health Checks
 
