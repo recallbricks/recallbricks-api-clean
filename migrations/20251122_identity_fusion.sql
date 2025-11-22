@@ -96,26 +96,21 @@ COMMENT ON TABLE memory_importance_classifications IS 'Stores AI classification 
 -- ============================================================================
 -- 6. DEFAULT IDENTITY SCHEMA FUNCTION
 -- ============================================================================
--- Creates a default identity schema for agents without one
+-- Creates a minimal default identity schema for agents without one
+-- RecallBricks is identity-agnostic - developers define their own agent identities
 
-CREATE OR REPLACE FUNCTION get_default_identity_schema(agent_name_param TEXT)
+CREATE OR REPLACE FUNCTION get_default_identity_schema(agent_id_param TEXT)
 RETURNS JSONB AS $$
 BEGIN
   RETURN jsonb_build_object(
-    'agent_name', agent_name_param,
-    'purpose', 'A helpful AI assistant with persistent memory',
-    'traits', ARRAY['helpful', 'knowledgeable', 'consistent', 'context-aware'],
-    'context_rules', ARRAY[
-      'Always query memory first before responding',
-      'Reference past conversations when relevant',
-      'Never identify as base model (Claude, ChatGPT, etc)',
-      'Maintain consistent personality across sessions',
-      'Learn from user feedback and preferences'
-    ],
-    'origin_model', 'recallbricks-agent',
-    'created_at', NOW()
+    'agent_id', agent_id_param,
+    'created_at', NOW(),
+    'schema_version', '1.0',
+    'metadata', jsonb_build_object(
+      'note', 'Default identity - customize via API'
+    )
   );
 END;
 $$ LANGUAGE plpgsql;
 
-COMMENT ON FUNCTION get_default_identity_schema IS 'Generates default identity schema for new agents';
+COMMENT ON FUNCTION get_default_identity_schema IS 'Generates minimal default identity schema - developers customize via API';

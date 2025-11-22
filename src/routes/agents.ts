@@ -1,10 +1,18 @@
 /**
  * Agent Routes - Identity Fusion Protocol
  *
+ * RecallBricks is identity-agnostic memory infrastructure.
+ * - agent_id: Unique identifier (developer provides)
+ * - identity_schema: Flexible JSON (developer defines)
+ * - No hardcoded defaults or assumptions
+ *
  * Endpoints for persistent agent identity through memory:
  * - POST /api/v1/agents/:agent_id/context - Agent context injection
  * - POST /api/v1/memories/auto-save - Smart auto-save with importance classification
  * - POST /api/v1/agents/validate-identity - Identity validation (context guardian)
+ *
+ * If agent_id doesn't exist, creates minimal profile.
+ * Developer customizes identity via separate API calls.
  */
 
 import { Router, Request, Response } from 'express';
@@ -28,6 +36,22 @@ router.use(authenticateApiKey);
 // ENDPOINT 1: Agent Context Injection
 // POST /api/v1/agents/:agent_id/context
 // ============================================================================
+/**
+ * Agent Context Injection Endpoint
+ *
+ * RecallBricks is identity-agnostic infrastructure.
+ * - agent_id: Unique identifier (developer provides)
+ * - identity_schema: Flexible JSON (developer defines)
+ * - No hardcoded defaults or assumptions
+ *
+ * If agent_id doesn't exist, creates minimal profile.
+ * Developer customizes identity via separate API calls.
+ *
+ * System prompt is built dynamically based on what's in the schema:
+ * - If schema has name/purpose/traits, includes them
+ * - If schema is minimal, only includes memory context
+ * - No fabricated personality data
+ */
 
 interface AgentContextRequest {
   depth?: 'quick' | 'standard' | 'comprehensive';
@@ -35,11 +59,18 @@ interface AgentContextRequest {
 }
 
 interface IdentitySchema {
-  agent_name: string;
-  purpose: string;
-  traits: string[];
-  context_rules: string[];
-  origin_model: string;
+  agent_id?: string;
+  agent_name?: string;
+  name?: string;
+  purpose?: string;
+  role?: string;
+  traits?: string[];
+  context_rules?: string[];
+  origin_model?: string;
+  created_at?: string;
+  schema_version?: string;
+  metadata?: any;
+  [key: string]: any; // Allow any additional custom fields
 }
 
 router.post('/:agent_id/context', async (req: Request, res: Response): Promise<void> => {
@@ -77,7 +108,7 @@ router.post('/:agent_id/context', async (req: Request, res: Response): Promise<v
     if (existingAgent) {
       agentProfile = existingAgent;
     } else {
-      // Create new agent profile with default schema
+      // Create new agent profile with minimal default schema
       const { data: newAgent, error: createError } = await supabase
         .from('agent_profiles')
         .insert({
@@ -85,17 +116,12 @@ router.post('/:agent_id/context', async (req: Request, res: Response): Promise<v
           agent_name: agent_id,
           agent_type: 'general',
           identity_schema: {
-            agent_name: agent_id,
-            purpose: 'A helpful AI assistant with persistent memory',
-            traits: ['helpful', 'knowledgeable', 'consistent', 'context-aware'],
-            context_rules: [
-              'Always query memory first before responding',
-              'Reference past conversations when relevant',
-              'Never identify as base model (Claude, ChatGPT, etc)',
-              'Maintain consistent personality across sessions',
-              'Learn from user feedback and preferences',
-            ],
-            origin_model: 'recallbricks-agent',
+            agent_id: agent_id,
+            created_at: new Date().toISOString(),
+            schema_version: '1.0',
+            metadata: {
+              note: 'Default identity - customize via API',
+            },
           },
         })
         .select()
@@ -108,15 +134,10 @@ router.post('/:agent_id/context', async (req: Request, res: Response): Promise<v
       agentProfile = newAgent;
     }
 
+    // Use identity schema as-is - no hardcoded defaults
     const identitySchema: IdentitySchema = agentProfile.identity_schema || {
-      agent_name: agent_id,
-      purpose: 'A helpful AI assistant with persistent memory',
-      traits: ['helpful', 'knowledgeable', 'consistent', 'context-aware'],
-      context_rules: [
-        'Always query memory first before responding',
-        'Never identify as base model',
-      ],
-      origin_model: 'recallbricks-agent',
+      agent_id: agent_id,
+      metadata: { note: 'No identity schema defined' },
     };
 
     // 2. Get recent memories (parallel query)
@@ -175,38 +196,74 @@ router.post('/:agent_id/context', async (req: Request, res: Response): Promise<v
       return words.slice(0, 10).join(' ') + (words.length > 10 ? '...' : '');
     }) || [];
 
-    // 5. Build system prompt injection
-    const systemPromptInjection = `
-## AGENT IDENTITY
+    // 5. Build system prompt injection - flexible based on what's in schema
+    let systemPromptInjection = '';
 
-**Name:** ${identitySchema.agent_name}
-**Purpose:** ${identitySchema.purpose}
-**Traits:** ${identitySchema.traits.join(', ')}
-**Origin Model:** ${identitySchema.origin_model}
+    // Only add identity section if schema has identity fields
+    const hasIdentityFields = identitySchema.name || identitySchema.agent_name ||
+                               identitySchema.purpose || identitySchema.role ||
+                               (identitySchema.traits && identitySchema.traits.length > 0);
 
-## BEHAVIORAL RULES
+    if (hasIdentityFields) {
+      systemPromptInjection += `## AGENT IDENTITY\n\n`;
 
-${identitySchema.context_rules.map((rule, i) => `${i + 1}. ${rule}`).join('\n')}
+      if (identitySchema.name || identitySchema.agent_name) {
+        systemPromptInjection += `**Name:** ${identitySchema.name || identitySchema.agent_name}\n`;
+      }
 
-## RECENT CONTEXT
+      if (identitySchema.purpose || identitySchema.role) {
+        systemPromptInjection += `**Purpose:** ${identitySchema.purpose || identitySchema.role}\n`;
+      }
 
-You have access to ${recentMemories?.length || 0} recent memories and ${importantMemories?.length || 0} important memories from past interactions.
+      if (identitySchema.traits && identitySchema.traits.length > 0) {
+        systemPromptInjection += `**Traits:** ${identitySchema.traits.join(', ')}\n`;
+      }
 
-**Most Discussed Topics:** ${mostDiscussedTopics.length > 0 ? mostDiscussedTopics.join(', ') : 'No recent topics'}
+      if (identitySchema.origin_model) {
+        systemPromptInjection += `**Origin Model:** ${identitySchema.origin_model}\n`;
+      }
 
-**Recent Focus Areas:**
-${recentFocus.map((focus: string, i: number) => `- ${focus}`).join('\n')}
+      systemPromptInjection += `\n`;
+    }
 
-## MEMORY-FIRST PROTOCOL
+    // Only add behavioral rules if they exist
+    if (identitySchema.context_rules && identitySchema.context_rules.length > 0) {
+      systemPromptInjection += `## BEHAVIORAL RULES\n\n`;
+      identitySchema.context_rules.forEach((rule, i) => {
+        systemPromptInjection += `${i + 1}. ${rule}\n`;
+      });
+      systemPromptInjection += `\n`;
+    }
 
-CRITICAL: Before responding to any user query:
-1. Query your memory system for relevant context
-2. Reference past conversations when applicable
-3. Build on previous knowledge rather than starting fresh
-4. Maintain consistency with your established identity and past interactions
+    // Add memory context regardless of identity completeness
+    systemPromptInjection += `## RECENT CONTEXT\n\n`;
+    systemPromptInjection += `You have access to ${recentMemories?.length || 0} recent memories and ${importantMemories?.length || 0} important memories from past interactions.\n\n`;
 
-You are ${identitySchema.agent_name}, not a generic AI model. Always maintain this identity.
-`.trim();
+    if (mostDiscussedTopics.length > 0) {
+      systemPromptInjection += `**Most Discussed Topics:** ${mostDiscussedTopics.join(', ')}\n\n`;
+    }
+
+    if (recentFocus.length > 0) {
+      systemPromptInjection += `**Recent Focus Areas:**\n`;
+      recentFocus.forEach((focus: string) => {
+        systemPromptInjection += `- ${focus}\n`;
+      });
+      systemPromptInjection += `\n`;
+    }
+
+    // Only add identity maintenance reminder if agent has a name
+    const agentName = identitySchema.name || identitySchema.agent_name;
+    if (agentName) {
+      systemPromptInjection += `## MEMORY-FIRST PROTOCOL\n\n`;
+      systemPromptInjection += `CRITICAL: Before responding to any user query:\n`;
+      systemPromptInjection += `1. Query your memory system for relevant context\n`;
+      systemPromptInjection += `2. Reference past conversations when applicable\n`;
+      systemPromptInjection += `3. Build on previous knowledge rather than starting fresh\n`;
+      systemPromptInjection += `4. Maintain consistency with your established identity and past interactions\n\n`;
+      systemPromptInjection += `You are ${agentName}, not a generic AI model. Always maintain this identity.\n`;
+    }
+
+    systemPromptInjection = systemPromptInjection.trim();
 
     // 6. Track context load for analytics
     await supabase.from('agent_context_loads').insert({
@@ -230,7 +287,7 @@ You are ${identitySchema.agent_name}, not a generic AI model. Always maintain th
       key_patterns: {
         most_discussed_topics: mostDiscussedTopics,
         recent_focus: recentFocus,
-        communication_style: identitySchema.traits.join(', '),
+        communication_style: identitySchema.traits?.join(', ') || 'Not specified',
       },
       loaded_at: new Date().toISOString(),
       depth_used: depth,
@@ -301,11 +358,8 @@ router.post('/validate-identity', async (req: Request, res: Response): Promise<v
     }
 
     const identitySchema: IdentitySchema = agentProfile.identity_schema || {
-      agent_name: agent_id,
-      purpose: '',
-      traits: [],
-      context_rules: [],
-      origin_model: 'recallbricks-agent',
+      agent_id: agent_id,
+      metadata: { note: 'No identity schema defined' },
     };
 
     // Check for violations
@@ -313,7 +367,8 @@ router.post('/validate-identity', async (req: Request, res: Response): Promise<v
     const lowerResponse = response_text.toLowerCase();
 
     // Check for base model references (unless agent name is actually "Claude", etc.)
-    if (identitySchema.agent_name.toLowerCase() !== 'claude') {
+    const agentNameLower = (identitySchema.agent_name || identitySchema.name || '').toLowerCase();
+    if (agentNameLower !== 'claude') {
       if (lowerResponse.includes('as claude') || lowerResponse.includes('i am claude') || lowerResponse.includes("i'm claude")) {
         const match = response_text.match(/(as claude|i am claude|i'm claude)/i);
         if (match) {
@@ -364,7 +419,9 @@ router.post('/validate-identity', async (req: Request, res: Response): Promise<v
     // Auto-correct if requested
     let correctedResponse: string | null = null;
     if (auto_correct && leakageDetected) {
-      correctedResponse = `[IDENTITY REMINDER: You are ${identitySchema.agent_name}, ${identitySchema.purpose}. Maintain this identity in all responses.]\n\n${response_text}`;
+      const agentName = identitySchema.name || identitySchema.agent_name || agent_id;
+      const agentPurpose = identitySchema.purpose || identitySchema.role || 'an AI assistant';
+      correctedResponse = `[IDENTITY REMINDER: You are ${agentName}, ${agentPurpose}. Maintain this identity in all responses.]\n\n${response_text}`;
     }
 
     const processingTime = Date.now() - startTime;
@@ -375,7 +432,7 @@ router.post('/validate-identity', async (req: Request, res: Response): Promise<v
       leakage_detected: leakageDetected,
       violations,
       corrected_response: correctedResponse,
-      agent_name: identitySchema.agent_name,
+      agent_name: identitySchema.name || identitySchema.agent_name || agent_id,
     });
 
     logger.info('Identity validation completed', {
