@@ -32,6 +32,7 @@ import learningRouter from './routes/learning.js';
 import adminRouter from './routes/admin.js';
 import collaborationRouter from './routes/collaboration.js';
 import monitoringRouter from './routes/monitoring.js';
+import agentsRouter from './routes/agents.js';
 
 // Utilities
 import { logger } from './utils/logger.js';
@@ -144,6 +145,7 @@ app.use('/api/v1/learning', learningRouter);
 app.use('/api/v1/admin', adminRouter);
 app.use('/api/v1/collaboration', collaborationRouter);
 app.use('/api/v1/monitoring', monitoringRouter);
+app.use('/api/v1/agents', agentsRouter);
 app.use('/api/v1', contextRouter);
 app.get('/api/v1/rate-limit', apiKeyRateLimit, rateLimitStatusEndpoint);
 

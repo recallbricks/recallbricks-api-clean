@@ -9,6 +9,7 @@ import { supabase } from '../config/supabase.js';
 import { authenticateApiKey } from '../middleware/auth.js';
 import { CreateMemoryRequest, Memory } from '../types/recallbricks.js';
 import OpenAI from 'openai';
+import Anthropic from '@anthropic-ai/sdk';
 import { detectRelationships } from '../services/relationshipDetector.js';
 import { relationshipConfig } from '../config/relationshipDetection.js';
 
@@ -17,6 +18,11 @@ const router = Router();
 // Initialize OpenAI client (optional)
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
+}) : null;
+
+// Initialize Anthropic client for classification (used in auto-save)
+const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY
 }) : null;
 
 // Function to extract key information using OpenAI GPT-4o-mini (optional)
@@ -1411,6 +1417,216 @@ router.get('/meta/patterns', async (req: Request, res: Response): Promise<void> 
     res.status(500).json({
       error: 'Internal Server Error',
       message: error.message || 'Failed to analyze patterns.'
+    });
+  }
+});
+
+/**
+ * POST /api/v1/memories/auto-save
+ * Smart Auto-Save with Importance Classification
+ * Automatically classifies conversation turns and saves important information
+ */
+
+interface AutoSaveRequest {
+  text: string;
+  context?: string;
+  user_id?: string;
+  force_save?: boolean;
+}
+
+interface ClassificationResult {
+  category: 'decision' | 'fact' | 'preference' | 'outcome' | 'brainstorming' | null;
+  should_save: boolean;
+  confidence: number;
+  reasoning: string;
+}
+
+router.post('/auto-save', async (req: Request, res: Response): Promise<void> => {
+  const startTime = Date.now();
+
+  try {
+    const user = req.user!;
+    const { text, context, force_save = false }: AutoSaveRequest = req.body;
+
+    if (!text || text.trim().length === 0) {
+      res.status(400).json({
+        error: 'Bad Request',
+        message: 'Text is required'
+      });
+      return;
+    }
+
+    console.log('Auto-save requested', {
+      textLength: text.length,
+      force_save,
+    });
+
+    let classification: ClassificationResult | null = null;
+    let memoryId: string | null = null;
+    let saved = false;
+
+    // If force_save is true, skip classification
+    if (force_save) {
+      const { data: memory, error: saveError } = await supabase
+        .from('memories')
+        .insert({
+          user_id: user.id,
+          text,
+          source: 'api',
+          project_id: 'default',
+          tags: ['auto-saved', 'force-saved'],
+          metadata: { force_saved: true, context },
+        })
+        .select('id')
+        .single();
+
+      if (saveError) throw saveError;
+
+      memoryId = memory.id;
+      saved = true;
+
+      // Log classification (even though we force-saved)
+      await supabase.from('memory_importance_classifications').insert({
+        memory_id: memoryId,
+        user_id: user.id,
+        category: null,
+        should_save: true,
+        confidence: 1.0,
+        reasoning: 'Force saved by user request',
+        classification_time_ms: Date.now() - startTime,
+        force_saved: true,
+      });
+
+    } else {
+      // Use Anthropic Claude Haiku for classification
+      if (!anthropic) {
+        res.status(500).json({
+          error: 'Server Error',
+          message: 'Anthropic API key not configured. Set ANTHROPIC_API_KEY environment variable.'
+        });
+        return;
+      }
+
+      const classificationStartTime = Date.now();
+
+      const prompt = `Analyze this conversation turn. Classify if it contains important information worth remembering.
+
+Categories (respond with JSON only):
+1. decision: An explicit decision was made
+2. fact: New factual information about the user or context
+3. preference: User expressed a preference or opinion
+4. outcome: A result or outcome of an action
+5. brainstorming: Just discussion/ideas without decisions
+
+Conversation turn:
+${text}
+
+${context ? `Additional context:\n${context}` : ''}
+
+Respond ONLY with valid JSON:
+{
+  "category": "decision" | "fact" | "preference" | "outcome" | "brainstorming",
+  "should_save": boolean,
+  "confidence": 0.0-1.0,
+  "reasoning": "brief explanation"
+}`;
+
+      try {
+        const response = await anthropic.messages.create({
+          model: 'claude-3-haiku-20240307',
+          max_tokens: 100,
+          messages: [{
+            role: 'user',
+            content: prompt,
+          }],
+        });
+
+        const contentBlock = response.content[0];
+        if (contentBlock.type === 'text') {
+          const result = JSON.parse(contentBlock.text);
+          classification = {
+            category: result.category,
+            should_save: result.should_save,
+            confidence: result.confidence,
+            reasoning: result.reasoning,
+          };
+
+          const classificationTime = Date.now() - classificationStartTime;
+
+          // If should_save is true, create the memory
+          if (classification.should_save) {
+            const { data: memory, error: saveError } = await supabase
+              .from('memories')
+              .insert({
+                user_id: user.id,
+                text,
+                source: 'api',
+                project_id: 'default',
+                tags: ['auto-saved', classification.category],
+                metadata: {
+                  classification: classification.category,
+                  confidence: classification.confidence,
+                  context,
+                },
+              })
+              .select('id')
+              .single();
+
+            if (saveError) throw saveError;
+
+            memoryId = memory.id;
+            saved = true;
+          }
+
+          // Log classification result
+          await supabase.from('memory_importance_classifications').insert({
+            memory_id: memoryId,
+            user_id: user.id,
+            category: classification.category,
+            should_save: classification.should_save,
+            confidence: classification.confidence,
+            reasoning: classification.reasoning,
+            classification_time_ms: classificationTime,
+            force_saved: false,
+          });
+
+          res.setHeader('X-Classification-Used', 'anthropic-haiku');
+        }
+      } catch (aiError: any) {
+        console.error('Classification failed', { error: aiError.message });
+        res.status(500).json({
+          error: 'Server Error',
+          message: 'Classification failed: ' + aiError.message
+        });
+        return;
+      }
+    }
+
+    const processingTime = Date.now() - startTime;
+    res.setHeader('X-Processing-Time-Ms', processingTime.toString());
+
+    res.json({
+      saved,
+      memory_id: memoryId,
+      category: classification?.category || null,
+      confidence: classification?.confidence || (force_save ? 1.0 : 0),
+      reasoning: classification?.reasoning || (force_save ? 'Force saved' : ''),
+      classification_time_ms: processingTime,
+    });
+
+    console.log('Auto-save completed', {
+      saved,
+      category: classification?.category,
+      processing_time_ms: processingTime,
+    });
+
+  } catch (error: any) {
+    console.error('Auto-save failed', {
+      error: error.message,
+    });
+    res.status(500).json({
+      error: 'Internal Server Error',
+      message: error.message || 'Failed to auto-save memory.'
     });
   }
 });

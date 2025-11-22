@@ -93,7 +93,7 @@ export async function authenticateApiKey(
       const { data: apiKeyData, error: apiKeyError } = await supabase
         .from('api_keys')
         .select('id, user_id, is_active')
-        .eq('key', apiKey)
+        .eq('key_hash', apiKey)
         .single();
 
       if (apiKeyError || !apiKeyData) {
