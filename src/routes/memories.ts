@@ -81,7 +81,19 @@ router.use(authenticateApiKey);
  */
 router.post('/', async (req: Request, res: Response): Promise<void> => {
   try {
-    const user = req.user!;
+    // Handle both service token auth and regular auth
+    const userId = (req as any).isServiceCall
+      ? req.body.user_id  // From service token request body
+      : req.user!.id;     // From authenticated user
+
+    if (!userId) {
+      res.status(400).json({
+        error: 'Bad Request',
+        message: 'user_id is required for service token requests'
+      });
+      return;
+    }
+
     const { text, source, project_id, tags, metadata, agent_id }: CreateMemoryRequest & { agent_id?: string } = req.body;
 
    // Extract key information (optional)
@@ -91,7 +103,7 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
     const embedding = await generateEmbedding(extractedText);
 
     const memory = {
-      user_id: user.id,
+      user_id: userId,
       text: extractedText,
       source: source || 'api',
       project_id: project_id || 'default',
@@ -138,7 +150,7 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
 
     // Trigger async relationship detection (fire-and-forget)
     if (data?.id && relationshipConfig.asyncExecution) {
-      detectRelationships(data.id, extractedText, user.id)
+      detectRelationships(data.id, extractedText, userId)
         .then(result => {
           if (result.success && result.relationshipsFound > 0) {
             console.log(`✓ Detected ${result.relationshipsFound} relationships for memory ${data.id}`);

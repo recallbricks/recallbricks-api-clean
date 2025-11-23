@@ -140,41 +140,99 @@ router.post('/:agent_id/context', async (req: Request, res: Response): Promise<v
       metadata: { note: 'No identity schema defined' },
     };
 
-    // 2. Get recent memories (parallel query)
-    const { data: recentMemories, error: recentError } = await supabase
-      .from('memories')
-      .select('id, text, created_at')
-      .eq('user_id', authenticatedUserId)
-      .order('created_at', { ascending: false })
-      .limit(limits.recent);
+    // 2. Get recent memories (parallel query) - defensive fetching
+    let recentMemories: any[] = [];
+    try {
+      const { data, error: recentError } = await supabase
+        .from('memories')
+        .select('id, text, created_at')
+        .eq('user_id', authenticatedUserId)
+        .order('created_at', { ascending: false })
+        .limit(limits.recent);
 
-    if (recentError) {
-      throw Errors.databaseError('Failed to fetch recent memories', { error: recentError.message });
+      if (recentError) {
+        logger.warn('Failed to fetch recent memories', {
+          error: recentError.message,
+          code: recentError.code,
+          details: recentError.details,
+          hint: recentError.hint,
+          user_id: authenticatedUserId,
+          agent_id,
+        });
+      } else {
+        recentMemories = data || [];
+      }
+    } catch (err: any) {
+      logger.error('Exception while fetching recent memories', {
+        error: err.message,
+        user_id: authenticatedUserId,
+        agent_id,
+      });
+      // Continue with empty array - don't fail the entire endpoint
     }
 
-    // 3. Get important memories (high helpfulness score)
-    const { data: importantMemories, error: importantError } = await supabase
-      .from('memories')
-      .select('id, text, helpfulness_score, usage_count')
-      .eq('user_id', authenticatedUserId)
-      .order('helpfulness_score', { ascending: false })
-      .limit(limits.important);
+    // 3. Get important memories (high helpfulness score) - defensive fetching
+    let importantMemories: any[] = [];
+    try {
+      const { data, error: importantError } = await supabase
+        .from('memories')
+        .select('id, text, helpfulness_score, usage_count')
+        .eq('user_id', authenticatedUserId)
+        .order('helpfulness_score', { ascending: false })
+        .limit(limits.important);
 
-    if (importantError) {
-      throw Errors.databaseError('Failed to fetch important memories', { error: importantError.message });
+      if (importantError) {
+        logger.warn('Failed to fetch important memories', {
+          error: importantError.message,
+          code: importantError.code,
+          details: importantError.details,
+          hint: importantError.hint,
+          user_id: authenticatedUserId,
+          agent_id,
+        });
+      } else {
+        importantMemories = data || [];
+      }
+    } catch (err: any) {
+      logger.error('Exception while fetching important memories', {
+        error: err.message,
+        user_id: authenticatedUserId,
+        agent_id,
+      });
+      // Continue with empty array - don't fail the entire endpoint
     }
 
-    // 4. Get usage patterns from last 7 days
+    // 4. Get usage patterns from last 7 days - defensive fetching
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
-    const { data: recentAccess } = await supabase
-      .from('memories')
-      .select('tags, metadata')
-      .eq('user_id', authenticatedUserId)
-      .gte('last_accessed', sevenDaysAgo.toISOString())
-      .order('usage_count', { ascending: false })
-      .limit(20);
+    let recentAccess: any[] = [];
+    try {
+      const { data, error: accessError } = await supabase
+        .from('memories')
+        .select('tags, metadata')
+        .eq('user_id', authenticatedUserId)
+        .gte('last_accessed', sevenDaysAgo.toISOString())
+        .order('usage_count', { ascending: false })
+        .limit(20);
+
+      if (accessError) {
+        logger.warn('Failed to fetch usage patterns', {
+          error: accessError.message,
+          user_id: authenticatedUserId,
+          agent_id,
+        });
+      } else {
+        recentAccess = data || [];
+      }
+    } catch (err: any) {
+      logger.error('Exception while fetching usage patterns', {
+        error: err.message,
+        user_id: authenticatedUserId,
+        agent_id,
+      });
+      // Continue with empty array
+    }
 
     // Extract key patterns
     const tagFrequency: Record<string, number> = {};
@@ -265,14 +323,22 @@ router.post('/:agent_id/context', async (req: Request, res: Response): Promise<v
 
     systemPromptInjection = systemPromptInjection.trim();
 
-    // 6. Track context load for analytics
-    await supabase.from('agent_context_loads').insert({
-      agent_id: agentProfile.id,
-      user_id: authenticatedUserId,
-      depth_level: depth,
-      memories_loaded: (recentMemories?.length || 0) + (importantMemories?.length || 0),
-      processing_time_ms: Date.now() - startTime,
-    });
+    // 6. Track context load for analytics (non-blocking)
+    try {
+      await supabase.from('agent_context_loads').insert({
+        agent_id: agentProfile.id,
+        user_id: authenticatedUserId,
+        depth_level: depth,
+        memories_loaded: (recentMemories?.length || 0) + (importantMemories?.length || 0),
+        processing_time_ms: Date.now() - startTime,
+      });
+    } catch (err: any) {
+      logger.warn('Failed to track context load analytics', {
+        error: err.message,
+        agent_id,
+      });
+      // Non-blocking - continue even if analytics fail
+    }
 
     const processingTime = Date.now() - startTime;
 
