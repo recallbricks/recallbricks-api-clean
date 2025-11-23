@@ -497,7 +497,7 @@ declare global {
       user?: User;
       userId?: string;
       userEmail?: string;
-      authMethod?: 'jwt' | 'api-key';
+      authMethod?: 'jwt' | 'api-key' | 'service-token';
     }
   }
 }

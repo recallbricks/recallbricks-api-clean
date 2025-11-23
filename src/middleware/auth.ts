@@ -2,10 +2,17 @@ import { Request, Response, NextFunction } from 'express';
 import { supabase } from '../config/supabase.js';
 import { Errors } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
+import { timingSafeEqual } from 'crypto';
 
 /**
- * Dual Authentication Middleware
- * Supports both JWT Bearer tokens and API keys
+ * Triple Authentication Middleware
+ * Supports service tokens, JWT Bearer tokens, and API keys
+ *
+ * Service Token Flow (highest priority):
+ * 1. Check X-Service-Token header
+ * 2. Compare with RECALLBRICKS_SERVICE_TOKEN env var using timing-safe comparison
+ * 3. If valid, set authMethod = 'service-token' and skip user identification
+ * 4. If invalid, reject with 401
  *
  * JWT Flow:
  * 1. Check Authorization: Bearer {token} header
@@ -25,6 +32,62 @@ export async function authenticateApiKey(
   next: NextFunction
 ): Promise<void> {
   try {
+    // Check for service token FIRST (service-to-service auth)
+    const serviceToken = req.headers['x-service-token'] as string;
+
+    if (serviceToken) {
+      const expectedToken = process.env.RECALLBRICKS_SERVICE_TOKEN;
+
+      logger.debug('Service token authentication attempt', {
+        requestId: req.requestId,
+        hasToken: !!serviceToken,
+        tokenPrefix: serviceToken ? serviceToken.substring(0, 10) + '...' : 'MISSING',
+      });
+
+      if (!expectedToken) {
+        logger.error('RECALLBRICKS_SERVICE_TOKEN not configured', {
+          requestId: req.requestId,
+        });
+        throw Errors.unauthorized('Service token authentication not configured');
+      }
+
+      // Use timing-safe comparison to prevent timing attacks
+      let isValid = false;
+      try {
+        const tokenBuffer = Buffer.from(serviceToken, 'utf8');
+        const expectedBuffer = Buffer.from(expectedToken, 'utf8');
+
+        // Only compare if lengths match (timingSafeEqual requires equal lengths)
+        if (tokenBuffer.length === expectedBuffer.length) {
+          isValid = timingSafeEqual(tokenBuffer, expectedBuffer);
+        }
+      } catch (error) {
+        logger.error('Service token comparison error', {
+          requestId: req.requestId,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+        isValid = false;
+      }
+
+      if (!isValid) {
+        logger.warn('Invalid service token attempt', {
+          requestId: req.requestId,
+          tokenPrefix: serviceToken.substring(0, 10) + '...',
+        });
+        throw Errors.unauthorized('Invalid service token');
+      }
+
+      // Service token is valid - set auth method and continue
+      req.authMethod = 'service-token';
+
+      logger.info('✓ Service token auth successful', {
+        requestId: req.requestId,
+        authMethod: 'service-token',
+      });
+
+      return next();
+    }
+
     // Check for JWT Bearer token first
     const authHeader = req.headers['authorization'] as string;
 
